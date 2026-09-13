@@ -1,0 +1,12 @@
+{
+  "name": "claude-dash",
+  "owner": {"name": "cty12356541", "url": "https://github.com/cty12356541"},
+  "plugins": [
+    {
+      "name": "dash",
+      "source": "./",
+      "description": "Lightweight project DAG dashboard for Claude Code: session-native hooks + git snapshot, zero config; SDD ledger as optional deep-semantics adapter. Terminal panel / character DAG / oneline statusline / HTML snapshot, interactive watch (focus, click-to-conversation).",
+      "version": "0.2.0"
+    }
+  ]
+}

@@ -1,5 +1,7 @@
 # dash — 项目推进仪表盘(Claude Code 插件)
 
+[English](README.en.md) | 中文
+
 dash 是面向 Claude Code 的轻量项目 DAG 仪表盘:会话原生(hooks 把 PostToolUse/Stop/SubagentStop 事件记入 `.dash/state.jsonl`)+ git 快照零配置(任何 git 仓库开箱即用,无需任何配置文件);当仓库存在 `.superpowers/sdd/*/dag.json` 台账时,自动以 SDD 账本为深语义适配层(波次/车道/屏障/停滞判定)。无常驻进程——每次调用即席渲染,退出即走,状态只落在仓库内 `.dash/` 与权威数据源本身。
 
 ## 快速开始
@@ -14,6 +16,8 @@ claude --plugin-dir /path/to/claude-dash
 
 ```bash
 python3 scripts/dash render panel   # 终端面板
+python3 scripts/dash render graph   # 终端字符 DAG(节点+边真图)
+python3 scripts/dash render html --open  # 浏览器 mermaid 真图快照
 python3 scripts/dash oneline        # 单行摘要
 ```
 
@@ -23,7 +27,7 @@ python3 scripts/dash oneline        # 单行摘要
 |---|---|---|
 | 插件目录直载 | `claude --plugin-dir /path/to/claude-dash` | 全部组件:技能 + hooks + CLI(`${CLAUDE_PLUGIN_ROOT}` 可用) |
 | 仓库级安装 | 把本仓库整棵拷贝为目标仓库的 `.claude/skills/dash/`(含 `.claude-plugin/plugin.json`,保持插件根完整) | 技能 + CLI 随仓库走;hooks 不随 `.claude/skills/` 注册 → 无会话事件层,仪表盘退化为 git + SDD 快照;纯技能形态下 `${CLAUDE_PLUGIN_ROOT}` 不注入,请按仓库路径直接调用(如 `python3 .claude/skills/dash/scripts/dash render panel`) |
-| marketplace | 待发布 | — |
+| marketplace 安装 | `claude plugin marketplace add cty12356541/claude-dash` 后 `claude plugin install dash@claude-dash` | 全部组件,一次安装常驻所有会话 |
 
 ## statusline 手配
 
@@ -63,7 +67,8 @@ python3 scripts/dash oneline        # 单行摘要
 
 ```bash
 export DASH_TMUX_TARGET="mysession:0.0"   # 指向你的主对话窗格
-python3 scripts/dash watch 5  # f 聚焦 c 散焦 ⏎ 送对话 q 退出
+python3 scripts/dash watch 5  # f 聚焦 c 散焦 ⏎ 送对话 g 图/面板切换 q 退出
+# 图视图下鼠标左键点击节点 = 聚焦该任务并把提示送进主对话(需终端支持 SGR 鼠标)
 ```
 
 ## 命令一览
@@ -71,11 +76,26 @@ python3 scripts/dash watch 5  # f 聚焦 c 散焦 ⏎ 送对话 q 退出
 | 命令 | 作用 |
 |---|---|
 | `dash render panel` | 终端面板(ANSI,尊重焦点) |
-| `dash render html` | HTML 快照 |
+| `dash render graph` | 终端字符 DAG:拓扑分层 + box-drawing 边;`watch` 中按 `g` 切换 |
+| `dash render html [--open]` | HTML 快照(嵌 mermaid.js CDN 真图);`--open` 写 `.dash/snapshot.html` 并唤起浏览器,`DASH_NO_OPEN=1` 仅写不开 |
 | `dash render mermaid [--inject]` | Mermaid 源码;`--inject` 写回最新 `.superpowers/sdd/*/progress.md`(唯一显式写副作用,且仅在 `--inject` 门后) |
 | `dash oneline` | statusline 单行(无 ANSI,零副作用) |
-| `dash watch [interval] [--once]` | 常驻刷新(缺省 5s);单键 f/c/⏎/q;`--once` 渲染一帧即退 |
+| `dash watch [interval] [--once]` | 常驻刷新(缺省 5s);单键 f/c/⏎/g/q + 图视图鼠标点击节点送话;`--once` 渲染一帧即退 |
 | `dash focus <task id>` / `dash focus clear` | 设置 / 清除面板焦点(下次面板刷新生效;v1 只按任务 id 聚焦,无匹配时面板优雅降级显示聚焦头) |
 | `dash send [--pane <target>]` | 把焦点现场提示送进主对话(tmux send-keys;`--pane` 覆盖 `DASH_TMUX_TARGET`;无焦点时报错退出 1) |
 
 `dash`(无参数)打印用法,退出码 2。
+
+## 平台支持
+
+| 平台 | 状态 |
+|---|---|
+| macOS | 全功能(panel/graph/html/oneline/watch 全部交互含鼠标送话) |
+| Linux | 渲染与 watch 全功能;`--open` 走 `xdg-open` 回退 |
+| Windows | 渲染类命令(panel/graph/html/oneline/statusline)可用;tmux 联动(⏎/点击送话)不可用,自动降级为可复制文本 |
+
+HTML 快照的 DAG 真图依赖 jsdelivr CDN 加载 mermaid.js;离线/内网环境下该区显示 mermaid 源码(其余区块不受影响)。
+
+## 许可证
+
+[MIT](LICENSE) © 2026 cty12356541
