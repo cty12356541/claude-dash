@@ -10,8 +10,11 @@ DASH = Path(__file__).resolve().parent / "dash"
 
 
 def run(args, cwd):
+    # encoding 固定 utf-8:dash 入口已把子进程 stdio 重配为 UTF-8,
+    # 本地默认(中文 Windows=GBK)解码会乱码导致断言假失败
     return subprocess.run([sys.executable, str(DASH), *args], cwd=cwd,
-                          capture_output=True, text=True)
+                          capture_output=True, text=True,
+                          encoding="utf-8", errors="replace")
 
 
 class TestFocusCli(unittest.TestCase):

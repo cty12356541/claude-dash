@@ -76,8 +76,11 @@ def load_session(state_path: Path, now_iso: str) -> Fragment:
 
 
 def _git(repo: Path, *args: str):
+    # encoding 显式 utf-8:中文 Windows 默认 GBK,text=True 会把 git 的 utf-8
+    # 输出(中文提交主题)解成乱码甚至 UnicodeDecodeError
     r = subprocess.run(["git", "-C", str(repo), *args],
-                       capture_output=True, text=True, timeout=5)
+                       capture_output=True, text=True, timeout=5,
+                       encoding="utf-8", errors="replace")
     if r.returncode != 0:
         raise RuntimeError(r.stderr.strip())
     return r.stdout
@@ -115,11 +118,15 @@ ACTIVE_WORDS = ("dispatched", "in-review", "in-progress", "fix round")
 
 
 def _resolve(ledger: str, n: int):
-    """返回 (state, note);语义与 scripts/render_dag.py resolve_status 一致。"""
-    for line in ledger.splitlines():
-        m = re.match(rf"Task {n}\s*: complete", line)
-        if m:
+    """返回 (state, note);语义与 scripts/render_dag.py resolve_status 一致。
+
+    complete 全扫优先:历史行(如 "fix round 1/5")常排在 complete 行之前,
+    首行生效语义会把已收口的任务永远卡在 active。"""
+    lines = ledger.splitlines()
+    for line in lines:
+        if re.match(rf"Task {n}\s*: complete", line):
             return "done", ""
+    for line in lines:
         m = re.match(rf"Task {n}\s*: (\S[^;(]*)", line)
         if m and any(w in m.group(1) for w in ACTIVE_WORDS):
             return "active", m.group(1).strip()
