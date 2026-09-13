@@ -7,6 +7,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+# 中文 Windows 默认 GBK stdio:git 输出解码与 '✓' 等字符打印都会 UnicodeError。
+# 入口处统一重配 UTF-8(仅 3.7+ TextIOWrapper 可重配;失败静默降级)。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        pass
+
 
 def _build_model(repo: Path):
     """构建统一模型;返回 (model, now_iso)。
@@ -65,15 +73,13 @@ def main() -> int:
         body = render_html(model, now)
         if "--open" in args:
             import os
-            import subprocess
             snap = repo / ".dash" / "snapshot.html"
             snap.parent.mkdir(exist_ok=True)
             snap.write_text(body, encoding="utf-8")
             print(f"snapshot → {snap}")
             if not os.environ.get("DASH_NO_OPEN"):
-                import platform
-                opener = "open" if platform.system() == "Darwin" else "xdg-open"
-                subprocess.run([opener, str(snap)], check=False)
+                from dashlib.opener import open_path
+                open_path(snap)
         else:
             print(body)
         return 0
@@ -110,7 +116,6 @@ def main() -> int:
         return 0
     if args[0] == "watch":
         import os
-        import select
         import time as _time
         interval = 5
         body = [a for a in args[1:] if not a.startswith("-")]
@@ -128,14 +133,13 @@ def main() -> int:
         pending_in = ""              # 半截鼠标序列挂起区(os.read 块级语义)
         # 与 send 同一解析序:env DASH_TMUX_TARGET → 默认 llmos-dag:0.0(pane 不存在时降级打印)
         pane = os.environ.get("DASH_TMUX_TARGET", DEFAULT_PANE)
-        tty = sys.stdin.isatty()
-        if tty:
-            import termios
-            import tty as _tty
-            old = termios.tcgetattr(sys.stdin.fileno())
-            # cbreak:canonical 模式下按键要等 ⏎ 才送达,且 f 后 readline 会吞残留换行
-            _tty.setcbreak(sys.stdin.fileno())
-            print("\033[?1000h\033[?1006h", end="", flush=True)   # SGR 鼠标
+        # 平台 shim:Unix=termios cbreak+select,Windows=msvcrt(无 termios);
+        # Windows 上 NUL 设备重定向后 isatty() 仍可能为 True,不能再据此 import termios
+        from dashlib.term import make_term
+        term = make_term(sys.stdin)
+        tty = True
+        term.enter()
+        print("\033[?1000h\033[?1006h", end="", flush=True)   # SGR 鼠标
         try:
             while True:
                 model, now = _build_model(repo)
@@ -149,12 +153,11 @@ def main() -> int:
                     return 0
                 deadline = _time.monotonic() + interval
                 while _time.monotonic() < deadline:
-                    if tty and select.select([sys.stdin], [], [], 0.2)[0]:
-                        data = os.read(sys.stdin.fileno(), 64)
+                    if term.wait(0.2):
+                        data = term.read(64)
                         if not data:
                             continue
-                        events, pending_in = parse_events(
-                            data.decode("utf-8", "replace"), pending_in)
+                        events, pending_in = parse_events(data, pending_in)
                         redraw = False
                         for ev in events:
                             if ev[0] == "mouse":
@@ -200,10 +203,8 @@ def main() -> int:
                     else:
                         _time.sleep(0.1)
         finally:
-            if tty:
-                print("\033[?1000l\033[?1006l", end="", flush=True)
-                import termios
-                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old)
+            print("\033[?1000l\033[?1006l", end="", flush=True)
+            term.exit()
         return 0
     if args[0] == "send":
         import os
