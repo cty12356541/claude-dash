@@ -7,11 +7,18 @@ layout_layers 是几何唯一源:render 画图与 hit_test 点击命中共用同
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from .model import Model, Task
 from .render_panel import C, MARK
+
+
+def _dw(s: str) -> int:
+    """显示宽:东亚宽字符(EAW W/F)占 2 列——框宽/列布局必须按显示列算,
+    码点数会把中文标签的框算窄,文字顶穿右边框(Windows 实测)。"""
+    return sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in s)
 
 _BARRIER_RE = re.compile(r"屏障\s*\S+\s*:\s*(\S+)\s*→\s*(.+)")
 _MOUSE_RE = re.compile(r"^\x1b\[<(\d+);(\d+);(\d+)M$")
@@ -104,7 +111,7 @@ def layout_layers(model: Model) -> Tuple[List[List[Task]], List[List[Cell]]]:
         cells, col = [], 0
         for t in layer:
             text = _cell_text(t)
-            w = len(text) + 2 * 1 + 2      # 左右内边距各 1 + 边框各 1
+            w = _dw(text) + 2 * 1 + 2      # 左右内边距各 1 + 边框各 1(显示列)
             cells.append(Cell(t.id, t.label, col, w, line))
             col += w + _CELL_GAP
         rows.append(cells)
@@ -160,37 +167,48 @@ def render_graph(model: Model, now_iso: str, width: int = 72) -> str:
                 put(bot, c.center, "┬", only_space=False)   # 出线桩
             put(txt, c.x, "│", only_space=False); put(txt, c.x + c.width - 1, "│", only_space=False)
             overlays.append((txt, c.x + 2, _colored(t),
-                             len(_cell_text(t))))             # 内边距 1 + 边框 1
+                             _dw(_cell_text(t))))             # 内边距 1 + 边框 1
             box_rows.setdefault(txt, []).append((c.x, c.x + c.width))
 
     def in_box(row: int, col: int) -> bool:
         return any(x0 <= col < x1 for x0, x1 in box_rows.get(row, ()))
 
-    # 2) 边路由(任意层距)
+    # 2) 边路由(任意层距;按子节点统一汇流):
+    #    各父框底中心垂直下落(跨层时穿过中间层空白带),在子框顶上方两格的
+    #    汇流行合并为一条水平段,中心列以 │ 接 ▼ 入框顶;父列在段中用 ┴ 三通,
+    #    段两端用 └/┘ 角折——消除"父线贴在横线旁一格、无接合符"的错位。
     for cid, parents in edges.items():
         cc = cell_of.get(cid)
         if cc is None:
             continue
+        drop_cols = []
         for pid in parents:
             pc = cell_of.get(pid)
             if pc is None:
                 continue
-            # 竖穿段:父框底下一行 → 子入线行(子框顶上一行)前一格
-            z_final = cc.line - 2               # 折线/直落行(紧贴子框顶上方)
+            z_final = cc.line - 2
             for row in range(pc.line + 2, z_final):
                 if not in_box(row, pc.center):
                     put(row, pc.center, "│")
-            if pc.center == cc.center:
-                put(z_final, pc.center, "│")
-            else:
-                corner_p = "└" if pc.center < cc.center else "┌"
-                corner_c = "┐" if pc.center < cc.center else "┘"
-                put(z_final, pc.center, corner_p)
-                put(z_final, cc.center, corner_c)
-                step = 1 if pc.center < cc.center else -1
-                for x in range(pc.center + step, cc.center, step):
-                    put(z_final, x, "─")
-            put(cc.line - 1, cc.center, "▼", only_space=False)   # 箭头嵌子框顶
+            drop_cols.append(pc.center)
+        if not drop_cols:
+            continue
+        lo, hi = min(drop_cols + [cc.center]), max(drop_cols + [cc.center])
+        z = cc.line - 2
+        for x in range(lo, hi + 1):
+            put(z, x, "─")
+        for x in drop_cols:                     # 父列接合符(覆盖自家水平段)
+            if x == cc.center:
+                put(z, x, "│", only_space=False)
+            elif lo < x < hi:
+                put(z, x, "┴", only_space=False)
+            elif x == lo:
+                put(z, x, "└", only_space=False)
+            else:                               # x == hi
+                put(z, x, "┘", only_space=False)
+        if canvas[z][cc.center] == "─":         # 子中心是段端且无父列:接下笔
+            canvas[z][cc.center] = "│"
+        put(cc.line - 1, cc.center, "▼", only_space=False)   # 箭头嵌子框顶
 
     # 3) 输出:纯字符行 + 着色覆盖(canvas 行号即最终输出行号——
     #    行 0/1 由标题/分隔线占据,框从行 2 起,故跳过画布头两行;
