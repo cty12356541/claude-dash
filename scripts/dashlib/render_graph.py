@@ -25,9 +25,13 @@ _HEAD_LINES = 2           # 标题 + 分隔线
 class Cell:
     id: str
     label: str
-    x: int                  # 起始列(0 基,ANSI 剥离后坐标)
-    width: int              # 纯文本宽
-    line: int               # 节点所在输出行(0 基)
+    x: int                  # 节点框左缘列(0 基,ANSI 剥离后坐标)
+    width: int              # 框外沿宽(含边框)
+    line: int               # 节点文字所在输出行(0 基);框占 line±1
+
+    @property
+    def center(self) -> int:
+        return self.x + self.width // 2
 
 
 def _edges(model: Model) -> Dict[str, set]:
@@ -82,19 +86,29 @@ def _cell_text(t: Task) -> str:
     return f"{MARK[t.state]} {t.id} {t.label[:_CELL_LABEL]}"
 
 
+_BOX_ROW = 3        # 每节点框占 3 行(顶/文字/底)
+_ZONE_ROW = 2       # 层间空档 2 行
+_LAYER_PITCH = _BOX_ROW + _ZONE_ROW
+_CANVAS_W = 240     # 画布宽(字符列表行缓冲)
+
+
 def layout_layers(model: Model) -> Tuple[List[List[Task]], List[List[Cell]]]:
-    """几何唯一源:每层节点的 (x, width, line)。line 计入头部两行与层间两行空档。"""
+    """几何唯一源:每层节点的 (x, width, line)。
+
+    节点带单线框(┌─┐│└┘):line 指向文字行,框占 line-1..line+1;
+    同层节点以 _CELL_GAP 间隔左→右排布。"""
     layers = compute_layers(model)
     rows: List[List[Cell]] = []
-    line = _HEAD_LINES
-    for i, layer in enumerate(layers):
+    line = _HEAD_LINES + 1          # 首层文字行:标题+分隔线之后,留框顶
+    for layer in layers:
         cells, col = [], 0
         for t in layer:
             text = _cell_text(t)
-            cells.append(Cell(t.id, t.label, col, len(text), line))
-            col += len(text) + _CELL_GAP
+            w = len(text) + 2 * 1 + 2      # 左右内边距各 1 + 边框各 1
+            cells.append(Cell(t.id, t.label, col, w, line))
+            col += w + _CELL_GAP
         rows.append(cells)
-        line += 1 + (0 if i + 1 == len(layers) else 2)   # 节点行 + (gap1+gap2)
+        line += _LAYER_PITCH
     return layers, rows
 
 
@@ -103,37 +117,99 @@ def _colored(t: Task) -> str:
 
 
 def render_graph(model: Model, now_iso: str, width: int = 72) -> str:
+    """框化节点 DAG:任意跨层边均路由(竖穿 + 角折 + ▼ 入框顶)。
+
+    路由策略(与"节点+边真图"的设计承诺一致):
+    - 父框底中心 ┬ 出线;子框顶中心以 ▼ 入线(替换顶框 ─)
+    - 相邻层:层间两行,│ 直落或 └─┐/┌─┘ 角折
+    - 跨多层:竖线沿父中心列穿过中间层行(仅写入空白,遇节点框让路——
+      结构碰撞时该段降级为断线,不覆盖任何节点/已有连线)
+    """
     layers, rows = layout_layers(model)
     edges = _edges(model)
-    out = [f"{model.project} · DAG", "─" * width]
-    for i in range(len(layers)):
-        line = ""
-        for cell in rows[i]:
-            t = next(t for t in layers[i] if t.id == cell.id)
-            line += " " * (cell.x - len(re.sub(r"\033\[[0-9;]*m", "", line))) + _colored(t)
-        out.append(line.rstrip())
-        if i + 1 == len(layers):
-            break
-        row_ids = {c.id: c.x for c in rows[i]}
-        next_row = {c.id: c.x for c in rows[i + 1]}
-        l1 = [" "] * (width * 2)
-        for cid in next_row:                        # 垂直段:每个有边父节点列
-            for p in edges.get(cid, ()):
-                if p in row_ids:
-                    l1[row_ids[p] + 1] = "│"
-        out.append("".join(l1).rstrip())
-        l2 = [" "] * (width * 2)
-        for cid, cx in next_row.items():            # 汇入箭头 ▼
-            l2[cx + 1] = "▼"
-        for cid, cx in next_row.items():            # 水平路由:父列 ── 到子列
-            for p in edges.get(cid, ()):
-                if p in row_ids:
-                    for x in range(min(row_ids[p], cx) + 1, max(row_ids[p], cx) + 2):
-                        if l2[x] == " ":
-                            l2[x] = "─"
-        out.append("".join(l2).rstrip())
-    out.append("─" * width)
-    return "\n".join(out)
+    by_id = {t.id: t for layer in layers for t in layer}
+    cell_of = {c.id: c for cells in rows for c in cells}
+    out_edges: Dict[str, set] = {}
+    for cid, parents in edges.items():
+        for p in parents:
+            out_edges.setdefault(p, set()).add(cid)
+
+    canvas = [[" "] * _CANVAS_W for _ in range(
+        _HEAD_LINES + 1 + _LAYER_PITCH * max(1, len(layers)) + 2)]
+    overlays: List[Tuple[int, int, str, int]] = []  # (row, col, 着色文字, 纯文本宽)
+
+    def put(row: int, col: int, ch: str, only_space: bool = True) -> bool:
+        if 0 <= row < len(canvas) and 0 <= col < _CANVAS_W:
+            if not only_space or canvas[row][col] == " ":
+                canvas[row][col] = ch
+                return True
+        return False
+
+    # 1) 节点框
+    box_rows: Dict[int, List[Tuple[int, int]]] = {}   # 文字行 → [(x, x+w)]
+    for cells in rows:
+        for c in cells:
+            t = by_id[c.id]
+            top, txt, bot = c.line - 1, c.line, c.line + 1
+            for x in range(c.x, c.x + c.width):
+                put(top, x, "─", only_space=False)
+                put(bot, x, "─", only_space=False)
+            put(top, c.x, "┌", only_space=False); put(top, c.x + c.width - 1, "┐", only_space=False)
+            put(bot, c.x, "└", only_space=False); put(bot, c.x + c.width - 1, "┘", only_space=False)
+            if out_edges.get(c.id):
+                put(bot, c.center, "┬", only_space=False)   # 出线桩
+            put(txt, c.x, "│", only_space=False); put(txt, c.x + c.width - 1, "│", only_space=False)
+            overlays.append((txt, c.x + 2, _colored(t),
+                             len(_cell_text(t))))             # 内边距 1 + 边框 1
+            box_rows.setdefault(txt, []).append((c.x, c.x + c.width))
+
+    def in_box(row: int, col: int) -> bool:
+        return any(x0 <= col < x1 for x0, x1 in box_rows.get(row, ()))
+
+    # 2) 边路由(任意层距)
+    for cid, parents in edges.items():
+        cc = cell_of.get(cid)
+        if cc is None:
+            continue
+        for pid in parents:
+            pc = cell_of.get(pid)
+            if pc is None:
+                continue
+            # 竖穿段:父框底下一行 → 子入线行(子框顶上一行)前一格
+            z_final = cc.line - 2               # 折线/直落行(紧贴子框顶上方)
+            for row in range(pc.line + 2, z_final):
+                if not in_box(row, pc.center):
+                    put(row, pc.center, "│")
+            if pc.center == cc.center:
+                put(z_final, pc.center, "│")
+            else:
+                corner_p = "└" if pc.center < cc.center else "┌"
+                corner_c = "┐" if pc.center < cc.center else "┘"
+                put(z_final, pc.center, corner_p)
+                put(z_final, cc.center, corner_c)
+                step = 1 if pc.center < cc.center else -1
+                for x in range(pc.center + step, cc.center, step):
+                    put(z_final, x, "─")
+            put(cc.line - 1, cc.center, "▼", only_space=False)   # 箭头嵌子框顶
+
+    # 3) 输出:纯字符行 + 着色覆盖(canvas 行号即最终输出行号——
+    #    行 0/1 由标题/分隔线占据,框从行 2 起,故跳过画布头两行;
+    #    覆盖按纯文本宽切片——ANSI 长度会吃掉框右缘)
+    lines = [f"{model.project} · DAG", "─" * width]
+    ol: Dict[int, List[Tuple[int, str, int]]] = {}
+    for r, c, s, plen in overlays:
+        ol.setdefault(r, []).append((c, s, plen))
+    last = len(canvas) - 1
+    while last >= _HEAD_LINES and not "".join(canvas[last]).strip():
+        last -= 1                                   # 裁尾部全空行(画布过量分配)
+    for r in range(_HEAD_LINES, last + 1):
+        line = "".join(canvas[r]).rstrip()
+        # 从右往左覆盖:低列插入的 ANSI 会推移高列切片位,反序则互不影响
+        for c, s, plen in sorted(ol.get(r, ()), reverse=True):
+            line = line[:c] + s + line[c + plen:]
+        lines.append(line.rstrip())
+    lines.append("─" * width)
+    return "\n".join(lines)
 
 
 def parse_mouse(seq: str) -> Optional[Tuple[int, int, int]]:
@@ -145,11 +221,11 @@ def parse_mouse(seq: str) -> Optional[Tuple[int, int, int]]:
 
 
 def hit_test(model: Model, col: int, row_1based: int) -> Optional[str]:
-    """终端 1 基 (col,row) → 命中的任务 id;空白处 None。"""
+    """终端 1 基 (col,row) → 命中的任务 id;命中区=节点框三行整框;空白 None。"""
     row = row_1based - 1
     for cells in layout_layers(model)[1]:
         for cell in cells:
-            if cell.line == row and cell.x <= col < cell.x + cell.width:
+            if cell.line - 1 <= row <= cell.line + 1 and cell.x <= col < cell.x + cell.width:
                 return cell.id
     return None
 
