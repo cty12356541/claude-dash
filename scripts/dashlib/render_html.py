@@ -1,9 +1,10 @@
-"""HTML 静态快照:单文件、内联 CSS、零外链零 JS、双主题。"""
+"""HTML 静态快照:单文件、内联 CSS、双主题;DAG 区嵌 mermaid.js(CDN)真图。"""
 from __future__ import annotations
 
 import html as _html
 
 from .model import Model
+from .render_mermaid import render_mermaid
 
 CSS = """
 :root{font-family:ui-monospace,Menlo,monospace;background:#0d1117;color:#c9d1d9}
@@ -24,10 +25,14 @@ def render_html(model: Model, now_iso: str) -> str:
     acts = "".join(f"<li>{_html.escape(a.label)}</li>" for a in model.activity) or "<li>无</li>"
     tasks = "".join(li(t) for t in model.tasks) or "<li>无</li>"
     warns = "".join(f"<li>⚠ {_html.escape(w)}</li>" for w in model.warnings)
+    graph = render_mermaid(model).strip().removeprefix("```mermaid").removesuffix("```").strip()
     return f"""<!DOCTYPE html>
 <html lang="zh"><head><meta charset="utf-8"><title>dash · {_html.escape(model.project)}</title>
-<style>{CSS}</style></head><body>
+<style>{CSS}</style>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({{startOnLoad:true}});</script></head><body>
 <h1>dash · {_html.escape(model.project)} <small>{now_iso}</small></h1>
+<section><h2>DAG</h2><pre class="mermaid">{_html.escape(graph)}</pre></section>
 <section><h2>在跑 / 健康</h2><ul>{acts}</ul><ul>{warns}</ul></section>
 <section><h2>轨迹</h2><ul>{ms}</ul></section>
 <section><h2>任务</h2><ul>{tasks}</ul></section>

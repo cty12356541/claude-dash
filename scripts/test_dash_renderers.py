@@ -112,7 +112,8 @@ class TestHtmlMermaid(unittest.TestCase):
         m = model([Task("T1", "注入 <script>alert(1)</script>", "done", source="sdd")])
         out = render_html(m, NOW)
         self.assertIn("&lt;script&gt;", out)
-        self.assertNotIn("<script>", out)
+        self.assertNotIn("<script>alert", out)          # 用户内容不得产生活标签
+        self.assertEqual(out.count("<script"), 2)        # 仅页面自有 mermaid 头部脚本
 
     def test_mermaid_laneless_and_barrier(self):
         from dashlib.render_mermaid import render_mermaid
