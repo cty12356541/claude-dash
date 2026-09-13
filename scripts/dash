@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""dash CLI:render panel|html|mermaid [--inject] / oneline / watch / focus / send。"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+
+def _build_model(repo: Path):
+    """构建统一模型;返回 (model, now_iso)。
+
+    oneline 走 statusline 路径,config.json 是用户可编辑文件:
+    读取/解析/阈值提取任一损坏(OSError/ValueError/KeyError/TypeError)
+    一律降级默认值,绝不抛错。
+    """
+    from datetime import datetime
+    from dashlib.adapters import load_session, load_git, load_sdd
+    from dashlib.merge import merge
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    threshold_h = 2.0
+    config_degraded = False
+    try:
+        import json
+        cfg = repo / ".dash" / "config.json"
+        config = json.loads(cfg.read_text(encoding="utf-8")) if cfg.exists() else {}
+        if not isinstance(config, dict):
+            config = {}   # 顶层非对象(数组/null 等)即损坏,视同 {}(默认生效)
+            config_degraded = True
+        threshold_h = float(config.get("stalled_threshold_h", 2.0))
+    except (OSError, ValueError, KeyError, TypeError):
+        threshold_h = 2.0   # 降级:config 视同 {},默认阈值生效
+        config_degraded = True
+    frags = [load_session(repo / ".dash" / "state.jsonl", now),
+             load_git(repo, now)]
+    sdd_frag, barriers = load_sdd(repo, now)
+    frags.append(sdd_frag)
+    model = merge(repo.resolve().name, frags, barriers, now, threshold_h=threshold_h)
+    if config_degraded:
+        model.warnings.append("config 损坏,已用缺省阈值")
+    return model, now
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if not args:
+        print(__doc__)
+        return 2
+    repo = Path.cwd()
+    if args[0] == "render" and len(args) > 1 and args[1] == "panel":
+        from dashlib.render_panel import render_panel
+        from dashlib.focus import read_focus
+        model, now = _build_model(repo)
+        print(render_panel(model, focus=read_focus(repo), now_iso=now))
+        return 0
+    if args[0] == "render" and len(args) > 1 and args[1] == "html":
+        from dashlib.render_html import render_html
+        model, now = _build_model(repo)
+        print(render_html(model, now))
+        return 0
+    if args[0] == "render" and len(args) > 1 and args[1] == "mermaid":
+        from dashlib.render_mermaid import inject_mermaid, render_mermaid
+        model, _now = _build_model(repo)
+        body = render_mermaid(model)
+        print(body)
+        if "--inject" in args:
+            # 与 load_sdd 同一选区口径:mtime 取最新工作区(复用同一 _mtime 守卫)
+            from dashlib.adapters import _mtime
+            workspaces = sorted((repo / ".superpowers" / "sdd").glob("*/dag.json"),
+                                key=_mtime)
+            if not workspaces:
+                print("dash: 无 .superpowers/sdd/*/dag.json 工作区,跳过注入")
+                return 0
+            ws = workspaces[-1].parent
+            inject_mermaid(ws, body)   # 唯一显式写副作用,且仅在 --inject 门后
+            print(f"mermaid → {ws / 'progress.md'}")
+        return 0
+    if args[0] == "oneline":
+        from dashlib.render_oneline import render_oneline
+        model, _now = _build_model(repo)
+        print(render_oneline(model))
+        return 0
+    if args[0] == "focus":
+        from dashlib.focus import write_focus
+        if len(args) < 2 or args[1] == "clear":
+            write_focus(repo, None)
+            print("已散焦")
+            return 0
+        write_focus(repo, args[1])
+        print(f"聚焦 {args[1]}(面板下次刷新生效;⏎ 送主对话)")
+        return 0
+    if args[0] == "watch":
+        import os
+        import select
+        import time as _time
+        interval = 5
+        body = [a for a in args[1:] if not a.startswith("-")]
+        if body:
+            try:
+                interval = max(1, int(body[0]))   # 下限 1s:防 0/负值把刷新环退化成忙轮询
+            except ValueError:
+                print(f"用法:dash watch [interval秒,整数] [--once];无法解析 {body[0]!r}", file=sys.stderr)
+                return 2
+        once = "--once" in args
+        from dashlib.focus import read_focus, write_focus
+        from dashlib.sendkeys import DEFAULT_PANE, compose_prompt, send_to_conversation
+        # 与 send 同一解析序:env DASH_TMUX_TARGET → 默认 llmos-dag:0.0(pane 不存在时降级打印)
+        pane = os.environ.get("DASH_TMUX_TARGET", DEFAULT_PANE)
+        tty = sys.stdin.isatty()
+        if tty:
+            import termios
+            import tty as _tty
+            old = termios.tcgetattr(sys.stdin.fileno())
+            # cbreak:canonical 模式下按键要等 ⏎ 才送达,且 f 后 readline 会吞残留换行
+            _tty.setcbreak(sys.stdin.fileno())
+        try:
+            while True:
+                model, now = _build_model(repo)
+                from dashlib.render_panel import render_panel
+                print("\033[2J\033[H" + render_panel(model, read_focus(repo), now), flush=True)
+                print(f"\n[dash watch] f聚焦 c散焦 ⏎送对话 q退出 · {interval}s 刷新", flush=True)
+                if once:
+                    return 0
+                deadline = _time.monotonic() + interval
+                while _time.monotonic() < deadline:
+                    if tty and select.select([sys.stdin], [], [], 0.2)[0]:
+                        ch = sys.stdin.read(1)
+                        if ch == "q":
+                            return 0
+                        if ch == "f":
+                            print("聚焦目标(task id):", end=" ", flush=True)
+                            write_focus(repo, sys.stdin.readline().strip())
+                            break
+                        if ch == "c":
+                            write_focus(repo, None)
+                            break
+                        if ch == "\n" or ch == "\r":
+                            target = read_focus(repo) or "当前波次"
+                            t = next((t for t in model.tasks if t.id == target), None)
+                            prompt = compose_prompt(target, t.label if t else "")
+                            result = send_to_conversation(prompt, pane)
+                            print(result, flush=True)
+                            if result != "sent":
+                                _time.sleep(2)   # 仅降级文本停留供复制;成功送达不拖慢刷新
+                            break
+                    else:
+                        _time.sleep(0.1)
+        finally:
+            if tty:
+                import termios
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old)
+        return 0
+    if args[0] == "send":
+        import os
+        from dashlib.focus import read_focus
+        from dashlib.sendkeys import DEFAULT_PANE, compose_prompt, send_to_conversation
+        target = read_focus(repo)
+        if not target:
+            print("dash send: 无焦点;先 dash focus <task id>", file=sys.stderr)
+            return 1
+        pane = None
+        if "--pane" in args and args.index("--pane") + 1 < len(args):
+            pane = args[args.index("--pane") + 1]
+        if pane is None:
+            pane = os.environ.get("DASH_TMUX_TARGET", DEFAULT_PANE)
+        model, _now = _build_model(repo)
+        t = next((t for t in model.tasks if t.id == target), None)
+        print(send_to_conversation(compose_prompt(target, t.label if t else ""), pane))
+        return 0
+    print(f"dash: 未实现子命令 {' '.join(args)}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
