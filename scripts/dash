@@ -65,6 +65,7 @@ def main() -> int:
         body = render_html(model, now)
         if "--open" in args:
             import os
+            import subprocess
             snap = repo / ".dash" / "snapshot.html"
             snap.parent.mkdir(exist_ok=True)
             snap.write_text(body, encoding="utf-8")
@@ -121,9 +122,10 @@ def main() -> int:
                 return 2
         once = "--once" in args
         from dashlib.focus import read_focus, write_focus
-        from dashlib.render_graph import next_view, render_graph
+        from dashlib.render_graph import hit_test, next_view, parse_events, render_graph
         from dashlib.sendkeys import DEFAULT_PANE, compose_prompt, send_to_conversation
         view = "panel"
+        pending_in = ""              # 半截鼠标序列挂起区(os.read 块级语义)
         # 与 send 同一解析序:env DASH_TMUX_TARGET → 默认 llmos-dag:0.0(pane 不存在时降级打印)
         pane = os.environ.get("DASH_TMUX_TARGET", DEFAULT_PANE)
         tty = sys.stdin.isatty()
@@ -133,6 +135,7 @@ def main() -> int:
             old = termios.tcgetattr(sys.stdin.fileno())
             # cbreak:canonical 模式下按键要等 ⏎ 才送达,且 f 后 readline 会吞残留换行
             _tty.setcbreak(sys.stdin.fileno())
+            print("\033[?1000h\033[?1006h", end="", flush=True)   # SGR 鼠标
         try:
             while True:
                 model, now = _build_model(repo)
@@ -147,32 +150,58 @@ def main() -> int:
                 deadline = _time.monotonic() + interval
                 while _time.monotonic() < deadline:
                     if tty and select.select([sys.stdin], [], [], 0.2)[0]:
-                        ch = sys.stdin.read(1)
-                        if ch == "q":
-                            return 0
-                        if ch == "g":
-                            view = next_view(view, "g")
-                            break                      # 立即重画新视图
-                        if ch == "f":
-                            print("聚焦目标(task id):", end=" ", flush=True)
-                            write_focus(repo, sys.stdin.readline().strip())
-                            break
-                        if ch == "c":
-                            write_focus(repo, None)
-                            break
-                        if ch == "\n" or ch == "\r":
-                            target = read_focus(repo) or "当前波次"
-                            t = next((t for t in model.tasks if t.id == target), None)
-                            prompt = compose_prompt(target, t.label if t else "")
-                            result = send_to_conversation(prompt, pane)
-                            print(result, flush=True)
-                            if result != "sent":
-                                _time.sleep(2)   # 仅降级文本停留供复制;成功送达不拖慢刷新
-                            break
+                        data = os.read(sys.stdin.fileno(), 64)
+                        if not data:
+                            continue
+                        events, pending_in = parse_events(
+                            data.decode("utf-8", "replace"), pending_in)
+                        redraw = False
+                        for ev in events:
+                            if ev[0] == "mouse":
+                                _, cx, cy = ev
+                                if view != "graph":
+                                    continue
+                                tid = hit_test(model, cx, cy)
+                                if not tid:
+                                    continue
+                                write_focus(repo, tid)
+                                t = next((t for t in model.tasks if t.id == tid), None)
+                                result = send_to_conversation(
+                                    compose_prompt(tid, t.label if t else ""), pane)
+                                print(result, flush=True)
+                                if result != "sent":
+                                    _time.sleep(2)
+                                redraw = True
+                                break
+                            ch = ev[1]
+                            if ch == "q":
+                                return 0
+                            if ch == "g":
+                                view = next_view(view, "g")
+                                redraw = True
+                            if ch == "f":
+                                print("聚焦目标(task id):", end=" ", flush=True)
+                                write_focus(repo, sys.stdin.readline().strip())
+                                redraw = True
+                            if ch == "c":
+                                write_focus(repo, None)
+                                redraw = True
+                            if ch == "\n" or ch == "\r":
+                                target = read_focus(repo) or "当前波次"
+                                t = next((t for t in model.tasks if t.id == target), None)
+                                prompt = compose_prompt(target, t.label if t else "")
+                                result = send_to_conversation(prompt, pane)
+                                print(result, flush=True)
+                                if result != "sent":
+                                    _time.sleep(2)
+                                redraw = True
+                            if redraw:
+                                break
                     else:
                         _time.sleep(0.1)
         finally:
             if tty:
+                print("\033[?1000l\033[?1006l", end="", flush=True)
                 import termios
                 termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old)
         return 0

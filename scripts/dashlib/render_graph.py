@@ -1,19 +1,33 @@
-"""终端字符 DAG:拓扑分层布局 + box-drawing 连接符。真正的"图",不是清单。
+"""终端字符 DAG:拓扑分层布局 + box-drawing 连接符 + 鼠标命中几何。
 
 分层 = 最长路径层号(同车道序 + 屏障边);环保险:迭代上限后剩余节点
 并入末层并列,不崩溃(spec §9 同精神:结构缺陷降级不白屏)。
+layout_layers 是几何唯一源:render 画图与 hit_test 点击命中共用同一 Cell 表。
 """
 from __future__ import annotations
 
 import re
-from typing import Dict, List
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 from .model import Model, Task
 from .render_panel import C, MARK
 
 _BARRIER_RE = re.compile(r"屏障\s*\S+\s*:\s*(\S+)\s*→\s*(.+)")
+_MOUSE_RE = re.compile(r"^\x1b\[<(\d+);(\d+);(\d+)M$")
+_MOUSE_PREFIX_RE = re.compile(r"\x1b\[<(\d+);(\d+);(\d+)M")   # 块级:无尾锚
 _CELL_LABEL = 16          # 节点单元格内 label 截断宽
 _CELL_GAP = 2             # 同层节点列间距
+_HEAD_LINES = 2           # 标题 + 分隔线
+
+
+@dataclass
+class Cell:
+    id: str
+    label: str
+    x: int                  # 起始列(0 基,ANSI 剥离后坐标)
+    width: int              # 纯文本宽
+    line: int               # 节点所在输出行(0 基)
 
 
 def _edges(model: Model) -> Dict[str, set]:
@@ -64,67 +78,108 @@ def compute_layers(model: Model) -> List[List[Task]]:
     return [l for l in layers if l] or [[t] for t in model.tasks] or [[]]
 
 
-def _cell(t: Task) -> str:
-    label = t.label[:_CELL_LABEL]
-    return f"{C[t.state]}{MARK[t.state]} {t.id} {label}{C['end']}"
+def _cell_text(t: Task) -> str:
+    return f"{MARK[t.state]} {t.id} {t.label[:_CELL_LABEL]}"
 
 
-def _plain(cell: str) -> int:
-    return len(re.sub(r"\033\[[0-9;]*m", "", cell))
+def layout_layers(model: Model) -> Tuple[List[List[Task]], List[List[Cell]]]:
+    """几何唯一源:每层节点的 (x, width, line)。line 计入头部两行与层间两行空档。"""
+    layers = compute_layers(model)
+    rows: List[List[Cell]] = []
+    line = _HEAD_LINES
+    for i, layer in enumerate(layers):
+        cells, col = [], 0
+        for t in layer:
+            text = _cell_text(t)
+            cells.append(Cell(t.id, t.label, col, len(text), line))
+            col += len(text) + _CELL_GAP
+        rows.append(cells)
+        line += 1 + (0 if i + 1 == len(layers) else 2)   # 节点行 + (gap1+gap2)
+    return layers, rows
+
+
+def _colored(t: Task) -> str:
+    return f"{C[t.state]}{_cell_text(t)}{C['end']}"
 
 
 def render_graph(model: Model, now_iso: str, width: int = 72) -> str:
-    layers = compute_layers(model)
+    layers, rows = layout_layers(model)
     edges = _edges(model)
-    rows = [[_cell(t) for t in layer] for layer in layers]
-    xs: List[List[int]] = []                        # 每层每节点的起始列
-    for row in rows:
-        col = 0
-        pos = []
-        for cell in row:
-            pos.append(col)
-            col += _plain(cell) + _CELL_GAP
-        xs.append(pos)
     out = [f"{model.project} · DAG", "─" * width]
-    next_ids = [{t.id for t in layers[i + 1]} for i in range(len(layers) - 1)]
-    for i, row in enumerate(rows):
+    for i in range(len(layers)):
         line = ""
-        for cell, x in zip(row, xs[i]):
-            line += " " * (x - _plain(line[:0]) - len(re.sub(r"\033\[[0-9;]*m", "", line))) + cell \
-                if line else cell
+        for cell in rows[i]:
+            t = next(t for t in layers[i] if t.id == cell.id)
+            line += " " * (cell.x - len(re.sub(r"\033\[[0-9;]*m", "", line))) + _colored(t)
         out.append(line.rstrip())
-        if i + 1 == len(rows):
+        if i + 1 == len(layers):
             break
-        gap1 = []                                   # 垂直段:父节点列
-        gap2 = []                                   # 水平段 + ▼ 汇入
-        parents_in_row = {t.id: xs[i][j] for j, t in enumerate(layers[i])}
-        for cid in next_ids[i]:
-            for p in edges.get(cid, ()):  # noqa: SIM118
-                if p in parents_in_row:
-                    gap1.append(parents_in_row[p])
-                    gap2.append(("h", parents_in_row[p]))
-        for cid in next_ids[i]:
-            j = next(k for k, t in enumerate(layers[i + 1]) if t.id == cid)
-            gap2.append(("v", xs[i + 1][j]))
-        l1 = [" "] * (width + 8)
-        for x in gap1:
-            l1[x + 1] = "│"
+        row_ids = {c.id: c.x for c in rows[i]}
+        next_row = {c.id: c.x for c in rows[i + 1]}
+        l1 = [" "] * (width * 2)
+        for cid in next_row:                        # 垂直段:每个有边父节点列
+            for p in edges.get(cid, ()):
+                if p in row_ids:
+                    l1[row_ids[p] + 1] = "│"
         out.append("".join(l1).rstrip())
-        l2 = [" "] * (width + 8)
-        for kind, x in gap2:
-            if kind == "v":
-                l2[x + 1] = "▼" if l2[x + 1] == " " else "▼"
-        horiz = [(x, y) for kind, x in [g for g in gap2 if g[0] == "h"] for y in
-                 [next((xs[i + 1][j] for j, t in enumerate(layers[i + 1])
-                        if t.id == cid), x) for cid in
-                  [t.id for t in layers[i + 1] if any(p in parents_in_row for p in edges.get(t.id, ()))]]]
-        for x1, x2 in horiz:
-            for x in range(min(x1, x2) + 1, max(x1, x2) + 2):
-                if l2[x] == " ":
-                    l2[x] = "─"
+        l2 = [" "] * (width * 2)
+        for cid, cx in next_row.items():            # 汇入箭头 ▼
+            l2[cx + 1] = "▼"
+        for cid, cx in next_row.items():            # 水平路由:父列 ── 到子列
+            for p in edges.get(cid, ()):
+                if p in row_ids:
+                    for x in range(min(row_ids[p], cx) + 1, max(row_ids[p], cx) + 2):
+                        if l2[x] == " ":
+                            l2[x] = "─"
         out.append("".join(l2).rstrip())
     out.append("─" * width)
     return "\n".join(out)
+
+
+def parse_mouse(seq: str) -> Optional[Tuple[int, int, int]]:
+    """SGR 鼠标序列 → (button, col, row);仅左键单击(button 0),其余/非鼠标 None。"""
+    m = _MOUSE_RE.match(seq)
+    if m and m.group(1) == "0":
+        return 0, int(m.group(2)), int(m.group(3))
+    return None
+
+
+def hit_test(model: Model, col: int, row_1based: int) -> Optional[str]:
+    """终端 1 基 (col,row) → 命中的任务 id;空白处 None。"""
+    row = row_1based - 1
+    for cells in layout_layers(model)[1]:
+        for cell in cells:
+            if cell.line == row and cell.x <= col < cell.x + cell.width:
+                return cell.id
+    return None
+
+
+def parse_events(chunk: str, pending: str = "") -> Tuple[List[Tuple], str]:
+    """os.read 整块 → 事件序列 + 未竟尾巴。
+
+    TextIO 缓冲教训:read(1) 会把整段鼠标序列吞进 Python 缓冲,select
+    再也看不到;必须 os.read 拿整块,在块级解析。左键单击出
+    ("mouse", col, row);普通键逐个 ("key", ch);其他 ESC 序列吞弃;
+    半截鼠标序列挂起等下一块。
+    """
+    buf = pending + chunk
+    events: List[Tuple] = []
+    while buf:
+        if buf.startswith("\x1b"):
+            m = _MOUSE_PREFIX_RE.match(buf)
+            if m:
+                if m.group(1) == "0":
+                    events.append(("mouse", int(m.group(2)), int(m.group(3))))
+                buf = buf[m.end():]
+                continue
+            if re.match(r"\x1b\[(?:<\d+(?:;\d*)*)?$", buf):   # 半截:挂起
+                return events, buf
+            m2 = re.match(r"\x1b\[[0-9;]*[A-Za-z]", buf)        # 其他 ESC 序列
+            buf = buf[m2.end():] if m2 else buf[1:]
+            continue
+        events.append(("key", buf[0]))
+        buf = buf[1:]
+    return events, ""
 
 
 def next_view(view: str, key: str) -> str:
